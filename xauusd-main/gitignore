@@ -1,0 +1,11 @@
+target/
+output/
+*.csv
+*.zip
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+.DS_Store
+*.log
