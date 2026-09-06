@@ -1,0 +1,401 @@
+name: Export Ticks
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Symbol (e.g. EURUSD, XAUUSD)"
+        required: true
+        default: "xauusd"
+        type: string
+      start:
+        description: "Start date/time UTC (YYYY-MM-DD HH:mm)"
+        required: true
+        default: "2003-01-01 00:00"
+        type: string
+      end:
+        description: "End date/time UTC, exclusive (YYYY-MM-DD HH:mm)"
+        required: true
+        default: "2026-09-01 00:00"
+        type: string
+      create_release:
+        description: "Create a GitHub Release per year?"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  # ==========================================================
+  # Prepare: validate dates and build list of years
+  # ==========================================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      from_date: ${{ steps.plan.outputs.from_date }}
+      to_date: ${{ steps.plan.outputs.to_date }}
+      years: ${{ steps.plan.outputs.years }}
+      start_year: ${{ steps.plan.outputs.start_year }}
+      end_year: ${{ steps.plan.outputs.end_year }}
+      instrument_upper: ${{ steps.plan.outputs.instrument_upper }}
+    steps:
+      - name: Build year list
+        id: plan
+        shell: bash
+        env:
+          OVERALL_FROM: ${{ inputs.start }}
+          OVERALL_TO: ${{ inputs.end }}
+          INSTRUMENT: ${{ inputs.symbol }}
+        run: |
+          set -euo pipefail
+
+          FROM_TS=$(date -u -d "$OVERALL_FROM" +%s)
+          TO_TS=$(date -u -d "$OVERALL_TO" +%s)
+
+          if [ "$FROM_TS" -ge "$TO_TS" ]; then
+            echo "::error::start ($OVERALL_FROM) must be before end ($OVERALL_TO)"
+            exit 1
+          fi
+
+          START_YEAR=$(date -u -d "$OVERALL_FROM" +%Y)
+          END_YEAR=$(date -u -d "$OVERALL_TO" +%Y)
+
+          # If end is exactly Jan 1st 00:00, that year has no data in an exclusive range
+          if [ "$(date -u -d "$OVERALL_TO" +%m-%d\ %H:%M)" = "01-01 00:00" ]; then
+            END_YEAR=$((END_YEAR - 1))
+          fi
+
+          LIST=""
+          for y in $(seq "$START_YEAR" "$END_YEAR"); do
+            LIST="${LIST:+$LIST,}$y"
+          done
+          YEARS="[$LIST]"
+
+          if [ "$YEARS" = "[]" ]; then
+            echo "::error::No years generated from the given range"
+            exit 1
+          fi
+
+          INSTRUMENT_UPPER=$(echo "$INSTRUMENT" | tr '[:lower:]' '[:upper:]')
+
+          echo "Overall range: $OVERALL_FROM -> $OVERALL_TO"
+          echo "Years to export: $YEARS"
+          echo "Instrument: $INSTRUMENT_UPPER"
+
+          echo "from_date=$OVERALL_FROM"               >> "$GITHUB_OUTPUT"
+          echo "to_date=$OVERALL_TO"                   >> "$GITHUB_OUTPUT"
+          echo "years=$YEARS"                          >> "$GITHUB_OUTPUT"
+          echo "start_year=$START_YEAR"                >> "$GITHUB_OUTPUT"
+          echo "end_year=$END_YEAR"                    >> "$GITHUB_OUTPUT"
+          echo "instrument_upper=$INSTRUMENT_UPPER"    >> "$GITHUB_OUTPUT"
+
+  # ==========================================================
+  # Export: one job per year (can run in parallel)
+  # ==========================================================
+  export:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        year: ${{ fromJson(needs.prepare.outputs.years) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - name: Build
+        run: mvn -B -q clean package -DskipTests
+
+      # ==========================================================
+      # Calculate year range (clamped to overall from/to)
+      # ==========================================================
+      - name: Calculate year range
+        id: range
+        shell: bash
+        env:
+          OVERALL_FROM: ${{ needs.prepare.outputs.from_date }}
+          OVERALL_TO: ${{ needs.prepare.outputs.to_date }}
+          YEAR: ${{ matrix.year }}
+          INSTRUMENT_UPPER: ${{ needs.prepare.outputs.instrument_upper }}
+        run: |
+          set -euo pipefail
+
+          YEAR_START="${YEAR}-01-01 00:00"
+          YEAR_END="$((YEAR + 1))-01-01 00:00"
+
+          # Start date: first year uses the real start, others use Jan 1st
+          if [ "$(date -u -d "$OVERALL_FROM" +%Y)" -eq "$YEAR" ]; then
+            FROM_DATE="$OVERALL_FROM"
+          else
+            FROM_DATE="$YEAR_START"
+          fi
+
+          # End date: last year uses the real end, others use next Jan 1st
+          if [ "$(date -u -d "$OVERALL_TO" +%Y)" -eq "$YEAR" ]; then
+            TO_DATE="$OVERALL_TO"
+          else
+            TO_DATE="$YEAR_END"
+          fi
+
+          # Safety check
+          if [ "$(date -u -d "$FROM_DATE" +%s)" -ge "$(date -u -d "$TO_DATE" +%s)" ]; then
+            echo "::error::Invalid range for $YEAR: $FROM_DATE -> $TO_DATE"
+            exit 1
+          fi
+
+          SLUG="ticks-${INSTRUMENT_UPPER}-${YEAR}"
+
+          echo "================================"
+          echo "Year: $YEAR"
+          echo "From: $FROM_DATE"
+          echo "To:   $TO_DATE"
+          echo "Slug: $SLUG"
+          echo "================================"
+
+          echo "from_date=$FROM_DATE" >> "$GITHUB_OUTPUT"
+          echo "to_date=$TO_DATE"     >> "$GITHUB_OUTPUT"
+          echo "slug=$SLUG"           >> "$GITHUB_OUTPUT"
+
+      # ==========================================================
+      # Download
+      # ==========================================================
+      - name: Run Tick Exporter
+        env:
+          DUKASCOPY_USERNAME: ${{ secrets.DUKASCOPY_USERNAME }}
+          DUKASCOPY_PASSWORD: ${{ secrets.DUKASCOPY_PASSWORD }}
+          INSTRUMENT: ${{ needs.prepare.outputs.instrument_upper }}
+          FROM: ${{ steps.range.outputs.from_date }}
+          TO: ${{ steps.range.outputs.to_date }}
+          OUTPUT_DIR: ./output
+        run: |
+          set -e
+          echo "Downloading ${INSTRUMENT}: ${FROM} -> ${TO}"
+          java -Xmx4g -jar target/jforex-tick-exporter-1.0.0.jar
+          echo "=== Output files ==="
+          ls -lh output/
+
+      - name: Zip CSV
+        id: zip
+        run: |
+          set -e
+          CSV=$(ls output/*.csv | head -n1)
+          ZIP="${{ steps.range.outputs.slug }}.zip"
+          zip -j "$ZIP" "$CSV"
+          echo "zip_path=$ZIP" >> "$GITHUB_OUTPUT"
+          ls -lh "$ZIP"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.range.outputs.slug }}
+          path: ${{ steps.zip.outputs.zip_path }}
+          retention-days: 14
+
+      # ==========================================================
+      # Release (one per year)
+      # ==========================================================
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.range.outputs.slug }}
+          name: Ticks ${{ needs.prepare.outputs.instrument_upper }} ${{ matrix.year }}
+          body: |
+            Tick data export from Dukascopy (JForex SDK)
+
+            - **Symbol**: `${{ needs.prepare.outputs.instrument_upper }}`
+            - **From (UTC)**: `${{ steps.range.outputs.from_date }}`
+            - **To (UTC, exclusive)**: `${{ steps.range.outputs.to_date }}`
+            - **Generated by**: GitHub Actions run ${{ github.run_id }}
+          files: ${{ steps.zip.outputs.zip_path }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================
+  # Send releases to Telegram (runs after ALL years finish)
+  # Messages are sent sequentially in chronological order.
+  # ==========================================================
+  send-to-telegram:
+    needs:
+      - prepare
+      - export
+    if: ${{ always() && inputs.create_release }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send releases to Telegram in chronological order
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OVERALL_FROM: ${{ needs.prepare.outputs.from_date }}
+          OVERALL_TO: ${{ needs.prepare.outputs.to_date }}
+          FROM_YEAR: ${{ needs.prepare.outputs.start_year }}
+          TO_YEAR: ${{ needs.prepare.outputs.end_year }}
+          INSTRUMENT_UPPER: ${{ needs.prepare.outputs.instrument_upper }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN secret is missing."; exit 1
+          fi
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::error::TELEGRAM_CHAT_ID secret is missing."; exit 1
+          fi
+
+          echo "=========================================="
+          echo "Starting Telegram sending"
+          echo "Instrument: $INSTRUMENT_UPPER"
+          echo "From year:  $FROM_YEAR"
+          echo "To year:    $TO_YEAR"
+          echo "=========================================="
+
+          FAILED=0
+
+          for ((YEAR=FROM_YEAR; YEAR<=TO_YEAR; YEAR++)); do
+            echo ""
+            echo "=========================================="
+            echo "Processing year: $YEAR"
+            echo "=========================================="
+
+            YEAR_START="${YEAR}-01-01 00:00"
+            YEAR_END="$((YEAR + 1))-01-01 00:00"
+
+            if [ "$(date -u -d "$OVERALL_FROM" +%Y)" -eq "$YEAR" ]; then
+              FROM_DATE="$OVERALL_FROM"
+            else
+              FROM_DATE="$YEAR_START"
+            fi
+
+            if [ "$(date -u -d "$OVERALL_TO" +%Y)" -eq "$YEAR" ]; then
+              TO_DATE="$OVERALL_TO"
+            else
+              TO_DATE="$YEAR_END"
+            fi
+
+            TAG="ticks-${INSTRUMENT_UPPER}-${YEAR}"
+            ASSET_NAME="${TAG}.zip"
+
+            echo "From: $FROM_DATE"
+            echo "To:   $TO_DATE"
+            echo "Tag:  $TAG"
+
+            # ---- Check release exists (skip year if download job failed) ----
+            if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::warning::Release not found for $YEAR ($TAG) - skipping."
+              FAILED=1
+              continue
+            fi
+
+            RELEASE_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+
+            # ---- Find ZIP asset URL ----
+            ASSET_URL=$(echo "$RELEASE_JSON" | python3 -c '
+          import sys, json
+          data = json.load(sys.stdin)
+          target = sys.argv[1]
+          for asset in data.get("assets", []):
+              if asset.get("name") == target:
+                  print(asset.get("browser_download_url", ""))
+                  break
+          ' "$ASSET_NAME")
+
+            DOWNLOAD_TEXT="Download ZIP"
+
+            # ---- Fallback: split parts (name.zip.001, .002, ...) ----
+            if [ -z "$ASSET_URL" ]; then
+              echo "Original ZIP not found. Checking split parts..."
+              FIRST_PART=$(echo "$RELEASE_JSON" | python3 -c '
+          import sys, json
+          data = json.load(sys.stdin)
+          target = sys.argv[1]
+          parts = [a for a in data.get("assets", []) if a.get("name", "").startswith(target + ".")]
+          parts.sort(key=lambda x: x.get("name", ""))
+          if parts:
+              print(parts[0].get("browser_download_url", ""))
+          ' "$ASSET_NAME")
+
+              if [ -z "$FIRST_PART" ]; then
+                echo "::warning::No ZIP or split parts found for $YEAR - skipping."
+                FAILED=1
+                continue
+              fi
+
+              ASSET_URL="$FIRST_PART"
+              DOWNLOAD_TEXT="Download (part 1 - see release for all parts)"
+            fi
+
+            # ---- Asset size ----
+            ASSET_SIZE=$(echo "$RELEASE_JSON" | python3 -c '
+          import sys, json
+          data = json.load(sys.stdin)
+          target = sys.argv[1]
+          for asset in data.get("assets", []):
+              if asset.get("name") == target:
+                  print(asset.get("size", 0))
+                  break
+          ' "$ASSET_NAME")
+            ASSET_SIZE="${ASSET_SIZE:-0}"
+            FILE_SIZE_MB=$(awk "BEGIN {printf \"%.2f\", $ASSET_SIZE / 1024 / 1024}")
+
+            RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+
+            # ---- Caption (matches Telegram format: title / date range / size) ----
+            FROM_DAY=$(date -u -d "$FROM_DATE" +%Y-%m-%d)
+            TO_DAY=$(date -u -d "$TO_DATE" +%Y-%m-%d)
+
+            CAPTION=$(printf \
+              '<b>%s Tick Data</b>\n📅 %s → %s\n💾 Size: %s MB' \
+              "$INSTRUMENT_UPPER" "$FROM_DAY" "$TO_DAY" "$FILE_SIZE_MB")
+
+            # ---- Inline keyboard: single DOWNLOAD button ----
+            KEYBOARD=$(python3 -c '
+          import json, sys
+          data = {"inline_keyboard": [
+              [{"text": "⬇️ DOWNLOAD", "url": sys.argv[1]}]
+          ]}
+          print(json.dumps(data, ensure_ascii=False))
+          ' "$ASSET_URL")
+
+            echo "Sending $YEAR to Telegram..."
+
+            RESPONSE=$(curl -sS \
+              --retry 3 --retry-delay 3 --retry-all-errors \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${CAPTION}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "reply_markup=${KEYBOARD}")
+
+            echo "$RESPONSE"
+
+            if ! echo "$RESPONSE" | grep -q '"ok":true'; then
+              echo "::error::Telegram failed for year $YEAR."
+              exit 1
+            fi
+
+            echo "SUCCESS: $YEAR sent to Telegram."
+            sleep 2
+          done
+
+          echo ""
+          if [ "$FAILED" -eq 1 ]; then
+            echo "::warning::Some years were skipped (release missing)."
+          fi
+          echo "=========================================="
+          echo "TELEGRAM SENDING FINISHED"
+          echo "=========================================="
